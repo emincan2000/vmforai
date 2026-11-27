@@ -3086,23 +3086,23 @@ cmd_cp() {
         *) src_base=$(basename -- "$p") ;;
       esac
     fi
-    local -a ps=(0 0 0)
+    local -a pst=(0 0 0)
     tar -cf - "${tar_args[@]}" 2>"$tar_err" \
       | cp_stream_count "$stats" \
-      | run_ssh -T -- "$TARGET" "$(remote_cmd "$CP_RECV_SH" "$dest" "$nsrc" "$src_is_dir" "$src_base" "$touch")" || ps=("${PIPESTATUS[@]}")
-    if ((ps[0] != 0 && ps[0] != 141)); then
+      | run_ssh -T -- "$TARGET" "$(remote_cmd "$CP_RECV_SH" "$dest" "$nsrc" "$src_is_dir" "$src_base" "$touch")" || pst=("${PIPESTATUS[@]}")
+    if ((pst[0] != 0 && pst[0] != 141)); then
       [[ -s $tar_err ]] && cat "$tar_err" >&2
       rm -f "$stats" "$tar_err"
-      return "${ps[0]}"
+      return "${pst[0]}"
     fi
-    if ((ps[2] != 0)); then
+    if ((pst[2] != 0)); then
       rm -f "$stats" "$tar_err"
-      ((ps[2] == 255)) && die "SSH connection to $C_USER@$TARGET:$C_PORT failed. Try: $PROG doctor $NAME"
-      return "${ps[2]}"
+      ((pst[2] == 255)) && die "SSH connection to $C_USER@$TARGET:$C_PORT failed. Try: $PROG doctor $NAME"
+      return "${pst[2]}"
     fi
-    if ((ps[1] != 0)); then
+    if ((pst[1] != 0)); then
       rm -f "$stats" "$tar_err"
-      return "${ps[1]}"
+      return "${pst[1]}"
     fi
   else
     local src_is_dot=0 mode='' extract_dir='' tmp=''
@@ -3132,28 +3132,28 @@ cmd_cp() {
     fi
     local -a tar_x=(-xf - -C "$extract_dir")
     ((touch)) && tar_x=(-xmf - -C "$extract_dir")
-    local -a ps=(0 0 0)
+    local -a pst=(0 0 0)
     run_ssh -T -- "$TARGET" "$(remote_cmd "$CP_SEND_SH" "${srcs[@]}")" </dev/null \
       | cp_stream_count "$stats" \
-      | tar "${tar_x[@]}" 2>"$tar_err" || ps=("${PIPESTATUS[@]}")
-    if ((ps[0] != 0)); then
+      | tar "${tar_x[@]}" 2>"$tar_err" || pst=("${PIPESTATUS[@]}")
+    if ((pst[0] != 0)); then
       [[ -n $tmp ]] && rm -rf "$tmp"
       if [[ $mode == new_dir ]]; then rmdir "$dclean" 2>/dev/null || true; fi
       rm -f "$stats" "$tar_err"
-      ((ps[0] == 255)) && die "SSH connection to $C_USER@$TARGET:$C_PORT failed. Try: $PROG doctor $NAME"
-      return "${ps[0]}"
+      ((pst[0] == 255)) && die "SSH connection to $C_USER@$TARGET:$C_PORT failed. Try: $PROG doctor $NAME"
+      return "${pst[0]}"
     fi
-    if ((ps[2] != 0)); then
+    if ((pst[2] != 0)); then
       [[ -s $tar_err ]] && cat "$tar_err" >&2
       [[ -n $tmp ]] && rm -rf "$tmp"
       if [[ $mode == new_dir ]]; then rmdir "$dclean" 2>/dev/null || true; fi
       rm -f "$stats" "$tar_err"
-      return "${ps[2]}"
+      return "${pst[2]}"
     fi
-    if ((ps[1] != 0)); then
+    if ((pst[1] != 0)); then
       [[ -n $tmp ]] && rm -rf "$tmp"
       rm -f "$stats" "$tar_err"
-      return "${ps[1]}"
+      return "${pst[1]}"
     fi
     if [[ $mode == replace_file || $mode == rename ]]; then
       local -a entries=()
@@ -3180,8 +3180,8 @@ cmd_cp() {
   local files=0 bytes=0 flabel=files blabel=bytes
   read -r files bytes <"$stats" || true
   rm -f "$stats" "$tar_err"
-  ((files == 1)) && flabel=file
-  ((bytes == 1)) && blabel=byte
+  ((files == 1)) && flabel='file'
+  ((bytes == 1)) && blabel='byte'
   if ((!from)); then
     say "Copied $files $flabel, $bytes $blabel to $NAME:$dest"
   else
