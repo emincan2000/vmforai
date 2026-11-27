@@ -109,7 +109,7 @@ class ProfileTests(SandboxTest):
         self.assertRegex(self.sb.run("list", check=0).stdout, r"\* a\s")
 
     def test_help_for_every_command(self):
-        for cmd in ("create", "delete", "images", "prune", "connect", "shell", "start", "stop", "autostop", "undo", "snapshot", "snapshots", "autosnap", "idle", "notify", "open", "ports", "resize", "ui", "clipboard", "agent", "doctor", "mcp", "add", "setup",
+        for cmd in ("create", "delete", "images", "prune", "connect", "shell", "cp", "start", "stop", "autostop", "undo", "snapshot", "snapshots", "autosnap", "idle", "notify", "open", "ports", "resize", "ui", "clipboard", "agent", "doctor", "mcp", "add", "setup",
                     "autostart", "list", "default", "desktop", "edit", "forget", "rm"):
             with self.subTest(cmd=cmd):
                 r = self.sb.run("help", cmd, check=0)

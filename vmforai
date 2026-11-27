@@ -19,7 +19,7 @@ if [[ -n ${VMFORAI_HOST_PATH:-} ]]; then
   unset VIRTUAL_ENV VMFORAI_HOST_PATH
 fi
 
-VERSION=0.27.0
+VERSION=0.28.0
 PROG=${0##*/}
 # vmforai was called vmagents (0.11 to 0.24) and vmclaude before that: their
 # settings in the environment (VMAGENTS_..., VMCLAUDE_...) still count.
@@ -131,6 +131,7 @@ COMMANDS
   Use a VM:
     connect NAME         open Claude Code ("vmforai NAME" does the same)
     shell NAME [CMD]     a normal shell on the VM, or run one command there
+    cp NAME SRC... DEST  copy files and folders to the VM (--from: from the VM; --touch)
     start NAME           start a libvirt VM and wait until SSH answers
     stop NAME            shut a libvirt VM down (--force: pull the plug)
     open NAME PORT       open the VM's port PORT here (http://localhost:PORT)
@@ -350,6 +351,31 @@ Examples:
   vmforai shell dev
   vmforai shell dev df -h
   vmforai shell dev 'cd ~/work && git status'
+EOF
+      ;;
+    cp) cat <<EOF
+vmforai cp NAME [--touch] SRC... DEST
+vmforai cp NAME --from [--touch] SRC... DEST
+
+Copies files and folders between this computer and a Linux VM, over SSH with
+tar (no rsync needed on the VM). Folders are copied recursively. A libvirt VM
+is started first if it is off, and stays on afterwards (like a single command
+with "vmforai shell").
+
+By default, SRC... are paths on this computer and DEST is on the VM. With
+--from, SRC... are on the VM and DEST is on this computer. Modification times
+are kept as they are unless --touch is given.
+
+Options:
+  --from        copy from the VM to this computer
+  --touch       set the modification time of copied files to now on the
+                receiving side (so make and similar tools rebuild them)
+
+Examples:
+  vmforai cp dev main.c util.c ~/proj        files into a folder on the VM
+  vmforai cp dev --touch src/ ~/proj         folder, with fresh timestamps for make
+  vmforai cp dev --from ~/proj/a.out .       a file back to this computer
+  vmforai cp dev --from ~/proj/dist ./dist   a folder back to this computer
 EOF
       ;;
     doctor) cat <<EOF
@@ -2774,6 +2800,393 @@ if (Test-Path -LiteralPath $PROFILE) { . $PROFILE }')" || rc=$?
   fi
   ((rc == 255 || keep)) || autostop
   return "$rc"
+}
+
+# Passes a tar stream through unchanged and writes "<files> <bytes>" to $1.
+# Runs on this computer in both directions so the VM only needs plain tar.
+IFS= read -r -d '' CP_COUNT_PY <<'PY' || true
+import sys
+
+inp, out = sys.stdin.buffer, sys.stdout.buffer
+
+
+def read_exact(n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = inp.read(n - len(buf))
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+files = total = 0
+pax_size = None
+try:
+    while True:
+        hdr = read_exact(512)
+        if not hdr:
+            break
+        out.write(hdr)
+        if len(hdr) < 512 or hdr == b"\0" * 512:
+            while True:
+                rest = inp.read(65536)
+                if not rest:
+                    break
+                out.write(rest)
+            break
+        sf = hdr[124:136]
+        if sf[0] & 0x80:
+            size = int.from_bytes(sf[1:], "big")
+        else:
+            s = sf.rstrip(b"\0 ").strip()
+            size = int(s, 8) if s else 0
+        tf = hdr[156:157]
+        pad = ((size + 511) // 512) * 512
+        if tf == b"x":
+            data = read_exact(pad)
+            out.write(data)
+            p = data[:size]
+            i = 0
+            while i < len(p):
+                sp = p.find(b" ", i)
+                if sp < 0:
+                    break
+                try:
+                    rec_len = int(p[i:sp])
+                except ValueError:
+                    break
+                if rec_len <= 0:
+                    break
+                rec = p[sp + 1:i + rec_len].rstrip(b"\n")
+                if rec.startswith(b"size="):
+                    try:
+                        pax_size = int(rec[5:])
+                    except ValueError:
+                        pass
+                i += rec_len
+            continue
+        if tf not in (b"g", b"L", b"K", b"X"):
+            actual = pax_size if pax_size is not None else size
+            pax_size = None
+            if tf != b"5":
+                files += 1
+                total += actual
+        rem = pad
+        while rem > 0:
+            chunk = inp.read(min(65536, rem))
+            if not chunk:
+                break
+            out.write(chunk)
+            rem -= len(chunk)
+    out.flush()
+except BrokenPipeError:
+    try:
+        out.close()
+    except BrokenPipeError:
+        pass
+    sys.exit(141)
+with open(sys.argv[1], "w") as f:
+    f.write(f"{files} {total}\n")
+PY
+
+cp_stream_count() { # STATS_FILE
+  if command -v python3 >/dev/null; then
+    python3 -c "$CP_COUNT_PY" "$1"
+  else
+    printf '0 0\n' >"$1"
+    cat
+  fi
+}
+
+# Remote receive side for "vmforai cp NAME SRC... DEST".
+# shellcheck disable=SC2016
+CP_RECV_SH='set -e
+dest=$1 nsrc=$2 src_is_dir=$3 src_base=$4 touch_flag=$5
+trailing=0
+case $dest in
+  ""|/) ;;
+  */) trailing=1 ;;
+esac
+case $dest in
+  "~") dest=$HOME ;;
+  "~/"*) dest=$HOME/${dest#"~/"} ;;
+esac
+while [ "$dest" != / ] && [ "${dest%/}" != "$dest" ]; do dest=${dest%/}; done
+xflags=-xf
+[ "$touch_flag" = 1 ] && xflags=-xmf
+command -v tar >/dev/null 2>&1 || { echo "vmforai: tar is not installed on the VM" >&2; exit 1; }
+mk_tmp() {
+  _p=$1 _i=0
+  while [ "$_i" -lt 100 ]; do
+    _t="$_p/.vmforai-cp.$$.$_i"
+    if mkdir "$_t" 2>/dev/null; then
+      printf "%s" "$_t"
+      return 0
+    fi
+    _i=$((_i + 1))
+  done
+  return 1
+}
+if [ -d "$dest" ]; then
+  [ -w "$dest" ] || { echo "vmforai: destination is not writable: $dest" >&2; exit 1; }
+  exec tar "$xflags" - -C "$dest"
+elif [ -e "$dest" ] || [ -L "$dest" ]; then
+  if [ "$nsrc" -gt 1 ] || [ "$src_is_dir" = 1 ] || [ "$trailing" = 1 ]; then
+    echo "vmforai: destination is not a directory: $dest" >&2
+    exit 1
+  fi
+  [ -w "$dest" ] || { echo "vmforai: destination is not writable: $dest" >&2; exit 1; }
+  parent=$(dirname -- "$dest")
+  [ -w "$parent" ] || { echo "vmforai: destination is not writable: $dest" >&2; exit 1; }
+  tmp=$(mk_tmp "$parent") || { echo "vmforai: destination is not writable: $dest" >&2; exit 1; }
+  trap '\''rm -rf "$tmp"'\'' EXIT INT TERM
+  tar "$xflags" - -C "$tmp"
+  mv -f -- "$tmp/$src_base" "$dest"
+  rm -rf "$tmp"
+  trap - EXIT INT TERM
+elif [ "$nsrc" -gt 1 ] || [ "$trailing" = 1 ] || [ "$src_base" = "." ]; then
+  mkdir -p -- "$dest" 2>/dev/null || { echo "vmforai: destination is not writable: $dest" >&2; exit 1; }
+  [ -w "$dest" ] || { echo "vmforai: destination is not writable: $dest" >&2; exit 1; }
+  exec tar "$xflags" - -C "$dest"
+else
+  parent=$(dirname -- "$dest")
+  mkdir -p -- "$parent" 2>/dev/null || { echo "vmforai: destination is not writable: $dest" >&2; exit 1; }
+  [ -w "$parent" ] || { echo "vmforai: destination is not writable: $dest" >&2; exit 1; }
+  tmp=$(mk_tmp "$parent") || { echo "vmforai: destination is not writable: $dest" >&2; exit 1; }
+  trap '\''rm -rf "$tmp"'\'' EXIT INT TERM
+  tar "$xflags" - -C "$tmp"
+  mv -- "$tmp/$src_base" "$dest"
+  rm -rf "$tmp"
+  trap - EXIT INT TERM
+fi
+'
+
+# Remote send side for "vmforai cp NAME --from SRC... DEST".
+# shellcheck disable=SC2016
+CP_SEND_SH='set -e
+command -v tar >/dev/null 2>&1 || { echo "vmforai: tar is not installed on the VM" >&2; exit 1; }
+for raw in "$@"; do
+  p=$raw
+  case $p in
+    "~") p=$HOME ;;
+    "~/"*) p=$HOME/${p#"~/"} ;;
+  esac
+  if [ ! -e "$p" ] && [ ! -L "$p" ]; then
+    echo "vmforai: source not found on VM: $raw" >&2
+    exit 1
+  fi
+done
+n=$#
+i=0
+while [ "$i" -lt "$n" ]; do
+  p=$1
+  shift
+  i=$((i + 1))
+  case $p in
+    "~") p=$HOME ;;
+    "~/"*) p=$HOME/${p#"~/"} ;;
+  esac
+  while [ "$p" != / ] && [ "${p%/}" != "$p" ]; do p=${p%/}; done
+  case $p in
+    /) set -- "$@" -C / . ;;
+    .|*/.) set -- "$@" -C "$p" . ;;
+    *)
+      parent=$(dirname -- "$p")
+      base=$(basename -- "$p")
+      set -- "$@" -C "$parent" "./$base"
+      ;;
+  esac
+done
+exec tar -cf - "$@"
+'
+
+cmd_cp() {
+  local from=0 touch=0 name='' dest=''
+  local -a pos=() srcs=()
+  while (($#)); do
+    case $1 in
+      --from) from=1; shift ;;
+      --touch) touch=1; shift ;;
+      --) shift; pos+=("$@"); break ;;
+      -*) usage_error "cp: unknown option $1" ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+  ((${#pos[@]} >= 1)) || usage_error "cp: missing NAME"
+  ((${#pos[@]} >= 3)) || usage_error "cp: give NAME, at least one SRC, and DEST"
+  name=${pos[0]}
+  dest=${pos[${#pos[@]}-1]}
+  srcs=("${pos[@]:1:${#pos[@]}-2}")
+  [[ -n $dest ]] || usage_error "cp: empty DEST"
+  local s
+  for s in "${srcs[@]}"; do
+    [[ -n $s ]] || usage_error "cp: empty SRC"
+  done
+
+  load "$name"
+  command -v tar >/dev/null || die "tar is not installed on this computer"
+
+  # Check local paths before starting or contacting the VM.
+  local dclean=$dest trailing=0
+  [[ $dest != / && $dest == */ ]] && trailing=1
+  while [[ $dclean != / && $dclean == */ ]]; do dclean=${dclean%/}; done
+  if ((!from)); then
+    for s in "${srcs[@]}"; do
+      [[ -e $s || -L $s ]] || die "source not found: $s"
+    done
+  else
+    if [[ -d $dclean ]]; then
+      [[ -w $dclean ]] || die "destination is not writable: $dest"
+    elif [[ -e $dclean || -L $dclean ]]; then
+      ((${#srcs[@]} > 1 || trailing == 1)) && die "destination is not a directory: $dest"
+      [[ -w $dclean ]] || die "destination is not writable: $dest"
+      local p; p=$(dirname -- "$dclean")
+      [[ -w $p ]] || die "destination is not writable: $dest"
+    else
+      local anc=$dclean
+      while [[ ! -e $anc && ! -L $anc && $anc != / && $anc != . ]]; do
+        anc=$(dirname -- "$anc")
+      done
+      [[ -d $anc ]] || die "destination is not a directory: $anc"
+      [[ -w $anc ]] || die "destination is not writable: $dest"
+    fi
+  fi
+
+  resolve_target
+  [[ $C_OS == windows ]] && die "cp is only for Linux VMs for now"
+  build_ssh_opts
+
+  local stats tar_err
+  stats=$(mktemp)
+  tar_err=$(mktemp)
+
+  if ((!from)); then
+    local -a tar_args=()
+    local p parent base nsrc=${#srcs[@]} src_is_dir=0 src_base=''
+    for s in "${srcs[@]}"; do
+      p=$s
+      while [[ $p != / && $p == */ ]]; do p=${p%/}; done
+      case $p in
+        /) tar_args+=(-C / .) ;;
+        . | */.) tar_args+=(-C "$p" .) ;;
+        *)
+          parent=$(dirname -- "$p")
+          base=$(basename -- "$p")
+          tar_args+=(-C "$parent" "./$base")
+          ;;
+      esac
+    done
+    if ((nsrc == 1)); then
+      p=${srcs[0]}
+      while [[ $p != / && $p == */ ]]; do p=${p%/}; done
+      [[ -d $p ]] && src_is_dir=1
+      case $p in
+        / | . | */.) src_base=. ;;
+        *) src_base=$(basename -- "$p") ;;
+      esac
+    fi
+    local -a ps=(0 0 0)
+    tar -cf - "${tar_args[@]}" 2>"$tar_err" \
+      | cp_stream_count "$stats" \
+      | run_ssh -T -- "$TARGET" "$(remote_cmd "$CP_RECV_SH" "$dest" "$nsrc" "$src_is_dir" "$src_base" "$touch")" || ps=("${PIPESTATUS[@]}")
+    if ((ps[0] != 0 && ps[0] != 141)); then
+      [[ -s $tar_err ]] && cat "$tar_err" >&2
+      rm -f "$stats" "$tar_err"
+      return "${ps[0]}"
+    fi
+    if ((ps[2] != 0)); then
+      rm -f "$stats" "$tar_err"
+      ((ps[2] == 255)) && die "SSH connection to $C_USER@$TARGET:$C_PORT failed. Try: $PROG doctor $NAME"
+      return "${ps[2]}"
+    fi
+    if ((ps[1] != 0)); then
+      rm -f "$stats" "$tar_err"
+      return "${ps[1]}"
+    fi
+  else
+    local src_is_dot=0 mode='' extract_dir='' tmp=''
+    if ((${#srcs[@]} == 1)); then
+      local sp=${srcs[0]}
+      while [[ $sp != / && $sp == */ ]]; do sp=${sp%/}; done
+      [[ $sp == . || $sp == */. || $sp == / ]] && src_is_dot=1
+    fi
+    if [[ -d $dclean ]]; then
+      mode=dir
+      extract_dir=$dclean
+    elif [[ -e $dclean || -L $dclean ]]; then
+      mode=replace_file
+      local parent; parent=$(dirname -- "$dclean")
+      tmp=$(mktemp -d "$parent/.vmforai-cp.XXXXXX") || { rm -f "$stats" "$tar_err"; die "destination is not writable: $dest"; }
+      extract_dir=$tmp
+    elif ((${#srcs[@]} > 1 || trailing == 1 || src_is_dot == 1)); then
+      mode=new_dir
+      mkdir -p -- "$dclean" || { rm -f "$stats" "$tar_err"; die "destination is not writable: $dest"; }
+      extract_dir=$dclean
+    else
+      mode=rename
+      local parent; parent=$(dirname -- "$dclean")
+      mkdir -p -- "$parent" || { rm -f "$stats" "$tar_err"; die "destination is not writable: $dest"; }
+      tmp=$(mktemp -d "$parent/.vmforai-cp.XXXXXX") || { rm -f "$stats" "$tar_err"; die "destination is not writable: $dest"; }
+      extract_dir=$tmp
+    fi
+    local -a tar_x=(-xf - -C "$extract_dir")
+    ((touch)) && tar_x=(-xmf - -C "$extract_dir")
+    local -a ps=(0 0 0)
+    run_ssh -T -- "$TARGET" "$(remote_cmd "$CP_SEND_SH" "${srcs[@]}")" </dev/null \
+      | cp_stream_count "$stats" \
+      | tar "${tar_x[@]}" 2>"$tar_err" || ps=("${PIPESTATUS[@]}")
+    if ((ps[0] != 0)); then
+      [[ -n $tmp ]] && rm -rf "$tmp"
+      if [[ $mode == new_dir ]]; then rmdir "$dclean" 2>/dev/null || true; fi
+      rm -f "$stats" "$tar_err"
+      ((ps[0] == 255)) && die "SSH connection to $C_USER@$TARGET:$C_PORT failed. Try: $PROG doctor $NAME"
+      return "${ps[0]}"
+    fi
+    if ((ps[2] != 0)); then
+      [[ -s $tar_err ]] && cat "$tar_err" >&2
+      [[ -n $tmp ]] && rm -rf "$tmp"
+      if [[ $mode == new_dir ]]; then rmdir "$dclean" 2>/dev/null || true; fi
+      rm -f "$stats" "$tar_err"
+      return "${ps[2]}"
+    fi
+    if ((ps[1] != 0)); then
+      [[ -n $tmp ]] && rm -rf "$tmp"
+      rm -f "$stats" "$tar_err"
+      return "${ps[1]}"
+    fi
+    if [[ $mode == replace_file || $mode == rename ]]; then
+      local -a entries=()
+      shopt -s dotglob nullglob
+      entries=("$tmp"/*)
+      shopt -u dotglob nullglob
+      if [[ $mode == replace_file ]]; then
+        if ((${#entries[@]} != 1)) || [[ -d ${entries[0]} ]]; then
+          rm -rf "$tmp" "$stats" "$tar_err"
+          die "destination is not a directory: $dest"
+        fi
+        mv -f -- "${entries[0]}" "$dclean"
+      elif ((${#entries[@]} == 1)); then
+        mv -- "${entries[0]}" "$dclean"
+      else
+        chmod 755 "$tmp"
+        mv -- "$tmp" "$dclean"
+        tmp=''
+      fi
+      [[ -n $tmp ]] && rm -rf "$tmp"
+    fi
+  fi
+
+  local files=0 bytes=0 flabel=files blabel=bytes
+  read -r files bytes <"$stats" || true
+  rm -f "$stats" "$tar_err"
+  ((files == 1)) && flabel=file
+  ((bytes == 1)) && blabel=byte
+  if ((!from)); then
+    say "Copied $files $flabel, $bytes $blabel to $NAME:$dest"
+  else
+    say "Copied $files $flabel, $bytes $blabel from $NAME to $dest"
+  fi
 }
 
 cmd_autostart() {
@@ -12247,7 +12660,7 @@ main() {
       if [[ -n ${2-} ]]; then help_cmd "$2"; else usage; fi ;;
     version | -V | --version) say "vmforai $VERSION" ;;
     __mcp-info | __mcp-run | __mcp-get | __mcp-put | __watch | __runwait | __proxy | __phone | __addr) shift; "cmd_$cmd" "$@" ;;
-    add | create | delete | images | prune | mcp | mount | umount | login | setup | connect | shell | start | stop | autostop | snapshot | snapshots | undo | autosnap | idle | notify | clipboard | open | view | ports | project | changes | take | fix | repo | repos | run | runs | try | tries | net | templates | history | phone | update | deps | tools | yolo | agent | resize | ui | autostart | doctor | list | default | desktop | edit | forget | rm)
+    add | create | delete | images | prune | mcp | mount | umount | login | setup | connect | shell | cp | start | stop | autostop | snapshot | snapshots | undo | autosnap | idle | notify | clipboard | open | view | ports | project | changes | take | fix | repo | repos | run | runs | try | tries | net | templates | history | phone | update | deps | tools | yolo | agent | resize | ui | autostart | doctor | list | default | desktop | edit | forget | rm)
       shift
       if wants_help "$cmd" "$@"; then help_cmd "$cmd"; return 0; fi
       "cmd_$cmd" "$@" ;;

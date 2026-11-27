@@ -600,6 +600,21 @@ kopyalama modunda kopyaladığın. Burada `xclip` ya da `xsel` (X11), `wl-copy`
 Terminal ve Xfce Terminal gibi VTE terminalleri OSC 52'yi anlamadığı için
 vmforai bunu böyle yapar.)
 
+### Dosya kopyalama
+
+```sh
+vmforai cp dev main.c util.c ~/proj       # dosyaları VM'deki bir klasöre
+vmforai cp dev --touch src/ ~/proj        # klasörü içindekilerle, make için güncel zamanlarla
+vmforai cp dev --from ~/proj/a.out .      # VM'den bu bilgisayara
+```
+
+Dosya ve klasörleri SSH üzerinden `tar` ile kopyalar (VM'de `rsync` gerekmez).
+Klasörler içindekilerle gider, kapalı bir libvirt VM'i önce başlatılır ve
+sonunda tek satırda dosya ve bayt sayısı yazılır. Değişiklik zamanları olduğu
+gibi korunur; `--touch` alıcı tarafta şimdiki zamana çeker, böylece `make`
+daha yeni derleme çıktılarının karşısında bunları yeniden derler. Yalnızca
+Linux VM'leri için.
+
 ### Diğer asistanlar
 
 ```sh
@@ -812,6 +827,7 @@ vmforai add AD [seçenekler]     var olan bir VM ekle ya da profilin alanların�
 vmforai setup AD [--agents LİSTE] [--no-install] [--no-autostart]
 vmforai connect [--keep] [--hold] [--no-tmux] [AD] [-- CLAUDE_ARGÜMANLARI]
 vmforai shell [--keep] AD [KOMUT]   VM'de düz kabuk ya da komut
+vmforai cp AD [--from] [--touch] KAYNAK... HEDEF   VM'e ya da VM'den dosya ve klasör kopyala
 vmforai start AD | stop AD [--force]
 
 vmforai run AD [--ASİSTAN] [--wait] GÖREV   bir asistana arka planda tek başına yapacağı görev

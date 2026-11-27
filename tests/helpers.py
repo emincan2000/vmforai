@@ -16,7 +16,7 @@ VMFORAI = ROOT / "vmforai"
 # Tools the remote scripts may use; the fake VM gets only these.
 REMOTE_TOOLS = ["sh", "bash", "cat", "grep", "mkdir", "touch", "tail", "wc", "chmod",
                 "awk", "rm", "basename", "id", "env", "head", "cp", "dirname", "ls",
-                "sed", "tr", "uname", "sleep", "du", "cut", "date", "mv", "ln"]
+                "sed", "tr", "uname", "sleep", "du", "cut", "date", "mv", "ln", "tar"]
 
 
 def write_exe(path, text):

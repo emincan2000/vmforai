@@ -599,6 +599,20 @@ you copy in tmux copy mode. Needs `xclip` or `xsel` (X11), `wl-copy`
 (VTE terminals such as GNOME Terminal and Xfce Terminal do not understand
 OSC 52, which is why vmforai does it this way.)
 
+### Copy files
+
+```sh
+vmforai cp dev main.c util.c ~/proj       # files into a folder on the VM
+vmforai cp dev --touch src/ ~/proj        # folder recursively, fresh timestamps for make
+vmforai cp dev --from ~/proj/a.out .      # from the VM back to this computer
+```
+
+Copies files and folders over SSH with `tar` (no `rsync` needed on the VM).
+Folders go recursively, a stopped libvirt VM is started first, and the command
+ends with a one-line file and byte count. Modification times stay as they are
+unless you pass `--touch`, which sets them to now on the receiving side so
+`make` rebuilds against newer build outputs. Linux VMs only.
+
 ### Other agents
 
 ```sh
@@ -810,6 +824,7 @@ vmforai add NAME [options]      add an existing VM, or change fields of a profil
 vmforai setup NAME [--agents LIST] [--no-install] [--no-autostart]
 vmforai connect [--keep] [--hold] [--no-tmux] [NAME] [-- CLAUDE_ARGS...]
 vmforai shell [--keep] NAME [CMD...]   plain shell or command on the VM
+vmforai cp NAME [--from] [--touch] SRC... DEST   copy files and folders to or from the VM
 vmforai start NAME | stop NAME [--force]
 
 vmforai run NAME [--AGENT] [--wait] TASK   a task for an agent, done alone in the background
